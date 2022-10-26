@@ -15,7 +15,9 @@
 #include <linux/blk-mq.h>
 #include <linux/blk-mq-virtio.h>
 #include <linux/numa.h>
+#include <linux/kthread.h>
 #include <uapi/linux/virtio_ring.h>
+#include <uapi/linux/sched/types.h>
 
 #define PART_BITS 4
 #define VQ_NAME_LEN 16
@@ -29,6 +31,9 @@
 #else
 #define VIRTIO_BLK_INLINE_SG_CNT	2
 #endif
+
+// 75 ms
+#define IONOTIFY_DEBOUNCE (75ULL * 1000 * 1000)
 
 static unsigned int num_request_queues;
 module_param(num_request_queues, uint, 0644);
@@ -80,6 +85,9 @@ struct virtio_blk {
 	int num_vqs;
 	int io_queues[HCTX_MAX_TYPES];
 	struct virtio_blk_vq *vqs;
+
+	wait_queue_head_t ionotify_wq;
+	bool ionotify_pending;
 };
 
 struct virtblk_req {
@@ -88,6 +96,45 @@ struct virtblk_req {
 	struct sg_table sg_table;
 	struct scatterlist sg[];
 };
+
+static int ionotify_thread(void *data)
+{
+	struct virtio_blk *vblk = data;
+	struct sched_param sched_prio = {
+		.sched_priority = 99,
+	};
+	uint64_t last_event_time = 0;
+	sched_setscheduler_nocheck(current, SCHED_FIFO, &sched_prio);
+
+	while (true) {
+		bool is_pending;
+
+		wait_event_interruptible(vblk->ionotify_wq,
+			(is_pending = READ_ONCE(vblk->ionotify_pending)) || kthread_should_stop());
+		pr_debug("ionotify: pending=%d\n", is_pending);
+
+		if (kthread_should_stop()) {
+			return 0;
+		}
+
+		if (is_pending) {
+			uint64_t now = ktime_get_ns();
+			if (now - last_event_time > IONOTIFY_DEBOUNCE) {
+				pr_debug("ionotify: notify sysfs\n");
+				sysfs_notify(&vblk->disk->part0->bd_device.kobj, NULL, "ionotify");
+				last_event_time = now;
+			}
+
+			WRITE_ONCE(vblk->ionotify_pending, false);
+		}
+	}
+}
+
+static void kick_ionotify(struct virtio_blk *vblk) {
+	pr_debug_ratelimited("ionotify: kick\n");
+	WRITE_ONCE(vblk->ionotify_pending, true);
+	wake_up(&vblk->ionotify_wq);
+}
 
 static inline blk_status_t virtblk_result(struct virtblk_req *vbr)
 {
@@ -303,6 +350,8 @@ static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
 	struct virtio_blk_vq *vq = &vblk->vqs[hctx->queue_num];
 	bool kick;
 
+	kick_ionotify(vblk);
+
 	spin_lock_irq(&vq->lock);
 	kick = virtqueue_kick_prepare(vq->vq);
 	spin_unlock_irq(&vq->lock);
@@ -348,6 +397,8 @@ static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
 	status = virtblk_prep_rq(hctx, vblk, req, vbr);
 	if (unlikely(status))
 		return status;
+
+	kick_ionotify(vblk);
 
 	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
 	err = virtblk_add_req(vblk->vqs[qid].vq, vbr);
@@ -435,6 +486,7 @@ static void virtio_queue_rqs(struct request **rqlist)
 
 		if (!next || req->mq_hctx != next->mq_hctx) {
 			req->rq_next = NULL;
+			kick_ionotify(req->mq_hctx->queue->queuedata);
 			kick = virtblk_add_req_batch(vq, rqlist);
 			if (kick)
 				virtqueue_notify(vq->vq);
@@ -770,9 +822,19 @@ cache_type_show(struct device *dev, struct device_attribute *attr, char *buf)
 
 static DEVICE_ATTR_RW(cache_type);
 
+static ssize_t
+ionotify_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	pr_debug("ionotify: show\n");
+	return sysfs_emit(buf, "1");
+}
+
+static DEVICE_ATTR_RO(ionotify);
+
 static struct attribute *virtblk_attrs[] = {
 	&dev_attr_serial.attr,
 	&dev_attr_cache_type.attr,
+	&dev_attr_ionotify.attr,
 	NULL,
 };
 
@@ -1073,6 +1135,10 @@ static int virtblk_probe(struct virtio_device *vdev)
 			     max_write_zeroes_sectors, &v);
 		blk_queue_max_write_zeroes_sectors(q, v ? v : UINT_MAX);
 	}
+
+	pr_debug("ionotify: init dev %s\n", vblk->disk->disk_name);
+	init_waitqueue_head(&vblk->ionotify_wq);
+	kthread_run(ionotify_thread, vblk, "ionotify/%s", vblk->disk->disk_name);
 
 	virtblk_update_capacity(vblk, false);
 	virtio_device_ready(vdev);
