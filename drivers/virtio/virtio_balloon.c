@@ -139,6 +139,7 @@ static void balloon_ack(struct virtqueue *vq)
 {
 	struct virtio_balloon *vb = vq->vdev->priv;
 
+	pr_info("vballoon: acked\n");
 	wake_up(&vb->acked);
 }
 
@@ -151,6 +152,7 @@ static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
 
 	/* We should always be able to add one buffer to an empty queue. */
 	virtqueue_add_outbuf(vq, &sg, 1, vb, GFP_KERNEL);
+	pr_info("vballoon: tell_host\n");
 	virtqueue_kick(vq);
 
 	/* When host has read buffer, this completes via balloon_ack */
@@ -177,6 +179,7 @@ static int virtballoon_free_page_report(struct page_reporting_dev_info *pr_dev_i
 	if (WARN_ON_ONCE(err))
 		return err;
 
+	pr_info("vballoon: free paged report\n");
 	virtqueue_kick(vq);
 
 	/* When host has read buffer, this completes via balloon_ack */
@@ -383,6 +386,7 @@ static void stats_handle_request(struct virtio_balloon *vb)
 		return;
 	sg_init_one(&sg, vb->stats, sizeof(vb->stats[0]) * num_stats);
 	virtqueue_add_outbuf(vq, &sg, 1, vb, GFP_KERNEL);
+	pr_info("vballoon: handle stats\n");
 	virtqueue_kick(vq);
 }
 
@@ -462,6 +466,7 @@ static void update_balloon_stats_func(struct work_struct *work)
 
 	vb = container_of(work, struct virtio_balloon,
 			  update_balloon_stats_work);
+	pr_info("vballoon: update stats\n");
 	stats_handle_request(vb);
 }
 
@@ -473,6 +478,8 @@ static void update_balloon_size_func(struct work_struct *work)
 	vb = container_of(work, struct virtio_balloon,
 			  update_balloon_size_work);
 	diff = towards_target(vb);
+
+	pr_info("vballoon: update balloon size: diff=%ld\n", diff);
 
 	if (!diff)
 		return;
@@ -550,6 +557,7 @@ static int init_vqs(struct virtio_balloon *vb)
 				 __func__);
 			return err;
 		}
+		pr_info("vballoon: init vqs kick stats\n");
 		virtqueue_kick(vb->stats_vq);
 	}
 
@@ -589,8 +597,10 @@ static int send_cmd_id_start(struct virtio_balloon *vb)
 					virtio_balloon_cmd_id_received(vb));
 	sg_init_one(&sg, &vb->cmd_id_active, sizeof(vb->cmd_id_active));
 	err = virtqueue_add_outbuf(vq, &sg, 1, &vb->cmd_id_active, GFP_KERNEL);
-	if (!err)
+	if (!err) {
+	pr_info("vballoon: send cmd start\n");
 		virtqueue_kick(vq);
+	}
 	return err;
 }
 
@@ -606,8 +616,10 @@ static int send_cmd_id_stop(struct virtio_balloon *vb)
 
 	sg_init_one(&sg, &vb->cmd_id_stop, sizeof(vb->cmd_id_stop));
 	err = virtqueue_add_outbuf(vq, &sg, 1, &vb->cmd_id_stop, GFP_KERNEL);
-	if (!err)
+	if (!err) {
+	pr_info("vballoon: send cmd stop\n");
 		virtqueue_kick(vq);
+	}
 	return err;
 }
 
@@ -642,6 +654,7 @@ static int get_free_page_and_send(struct virtio_balloon *vb)
 				   VIRTIO_BALLOON_HINT_BLOCK_ORDER);
 			return err;
 		}
+		pr_info("vballoon: get free page and send\n");
 		virtqueue_kick(vq);
 		spin_lock_irq(&vb->free_page_list_lock);
 		balloon_page_push(&vb->free_page_list, page);
@@ -691,6 +704,8 @@ static void virtio_balloon_report_free_page(struct virtio_balloon *vb)
 {
 	int err;
 	struct device *dev = &vb->vdev->dev;
+
+	pr_info("vballoon: report free page.\n");
 
 	/* Start by sending the received cmd id to host with an outbuf. */
 	err = send_cmd_id_start(vb);
